@@ -96,7 +96,7 @@ extras["dev"] = extras["testing"] + extras["quality"] + ["mecab-python3<1", "sci
 
 setup(
     name="transformers",
-    version="3.0.0",
+    version="3.0.0-backports",
     author="Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Sam Shleifer, Patrick von Platen, Google AI Language Team Authors, Open AI team Authors, Facebook AI Authors, Carnegie Mellon University Authors",
     author_email="thomas@huggingface.co",
     description="State-of-the-art Natural Language Processing for TensorFlow 2.0 and PyTorch",
