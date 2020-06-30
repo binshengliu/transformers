@@ -557,6 +557,8 @@ if is_torch_available():
         T5ForConditionalGeneration,
         T5Model,
         T5PreTrainedModel,
+        T5LMForVariants,
+        T5ForSequenceClassification,
         load_tf_weights_in_t5,
     )
     from .modeling_transfo_xl import (
