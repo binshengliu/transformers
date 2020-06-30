@@ -132,7 +132,7 @@ from .modeling_roberta import (
     RobertaForTokenClassification,
     RobertaModel,
 )
-from .modeling_t5 import T5ForConditionalGeneration, T5Model
+from .modeling_t5 import T5ForConditionalGeneration, T5ForSequenceClassification, T5Model
 from .modeling_transfo_xl import TransfoXLLMHeadModel, TransfoXLModel
 from .modeling_xlm import (
     XLMForQuestionAnsweringSimple,
@@ -293,6 +293,7 @@ MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING = OrderedDict(
         (FlaubertConfig, FlaubertForSequenceClassification),
         (XLMConfig, XLMForSequenceClassification),
         (ElectraConfig, ElectraForSequenceClassification),
+        (T5Config, T5ForSequenceClassification),
     ]
 )
 

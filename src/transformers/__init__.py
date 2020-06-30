@@ -313,6 +313,8 @@ if is_torch_available():
         T5PreTrainedModel,
         T5Model,
         T5ForConditionalGeneration,
+        T5LMForVariants,
+        T5ForSequenceClassification,
         load_tf_weights_in_t5,
         T5_PRETRAINED_MODEL_ARCHIVE_LIST,
     )
