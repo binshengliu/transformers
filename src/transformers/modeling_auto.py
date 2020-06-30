@@ -187,7 +187,7 @@ from .modeling_squeezebert import (
     SqueezeBertForTokenClassification,
     SqueezeBertModel,
 )
-from .modeling_t5 import T5ForConditionalGeneration, T5Model
+from .modeling_t5 import T5ForConditionalGeneration, T5ForSequenceClassification, T5Model
 from .modeling_transfo_xl import TransfoXLLMHeadModel, TransfoXLModel
 from .modeling_xlm import (
     XLMForMultipleChoice,
@@ -396,6 +396,7 @@ MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING = OrderedDict(
         (DebertaConfig, DebertaForSequenceClassification),
         (GPT2Config, GPT2ForSequenceClassification),
         (OpenAIGPTConfig, OpenAIGPTForSequenceClassification),
+        (T5Config, T5ForSequenceClassification),
     ]
 )
 
