@@ -22,7 +22,9 @@ import os
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, MSELoss
+
+from transformers.generation_beam_search import BeamHypotheses
 
 from ...activations import ACT2FN
 from ...file_utils import (
@@ -1329,3 +1331,216 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
+
+
+class T5LMForVariants(T5PreTrainedModel):
+    base_model_prefix = "t5"
+
+    def __init__(self, config):
+        super(T5LMForVariants, self).__init__(config)
+        self.t5 = T5ForConditionalGeneration(config)
+
+    def forward(self,
+                input_ids,
+                attention_mask=None,
+                labels=None,
+                candidates=None):
+        assert labels is None or candidates is None
+        if labels is not None:
+            masked_labels = labels.clone()
+            masked_labels[labels == 0] = -1
+            decoder_attention_mask = labels.clone().bool().int()
+            inputs = {
+                'encoder_input_ids': input_ids,
+                'encoder_attention_mask': attention_mask,
+                'decoder_input_ids': labels,
+                'decoder_attention_mask': decoder_attention_mask,
+                'decoder_lm_labels': masked_labels
+            }
+            outputs = self.t5(**inputs)
+            loss, logits = outputs[:2]
+            return loss.unsqueeze(0), logits
+        else:
+            return self.beam(input_ids, candidates, num_beams=5)
+
+    @torch.no_grad()
+    def beam(self, input_ids, candidates, num_beams):
+        assert input_ids.dim() == 2
+        batch_size, vocab_size = candidates.size()
+        vocab_size -= 1
+
+        input_ids = input_ids.unsqueeze(1).expand(-1, num_beams, -1)
+        input_ids = input_ids.reshape(-1, input_ids.size(-1))
+
+        # current position and vocab size
+        model_inputs = {
+            'encoder_input_ids': input_ids,
+            'encoder_attention_mask': (input_ids != 0).bool().int()
+        }
+
+        # (batch_size * num_beams, candidates)
+        candidates = candidates.unsqueeze(1).expand(-1, num_beams, -1)
+        candidates = candidates.reshape(-1, candidates.size(-1))
+
+        decoder_input_ids = candidates[:, :1]
+        candidates = candidates[:, 1:]
+
+        beam_scores = candidates.new_zeros((batch_size, num_beams))
+        # IMPORTANT: trick for breaking ties in the first iteration
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+
+        assert beam_scores.numel() == batch_size * num_beams
+
+        hyps = [
+            BeamHypotheses(num_beams, vocab_size, 1, early_stopping=False)
+            for _ in range(batch_size)
+        ]
+
+        # The reasonable shape of data should be 3D: (batch_size,
+        # beam_size, vocab_size). In adaptation to underlying model,
+        # keep in mind data are processed in 2D: (batch_size *
+        # num_beams, vocab_size) within the loop.
+        eos = self.config.eos_token_ids
+        max_token = candidates.bool().sum(dim=1).max() - 1
+        num_beams = min(num_beams, max_token)
+        for gen_idx in range(max_token):
+            decoder_attention_mask = (decoder_input_ids != 0).bool().int()
+            model_inputs.update(
+                {
+                    'decoder_input_ids': decoder_input_ids,
+                    'decoder_attention_mask': decoder_attention_mask,
+                }, )
+            outputs = self.t5(**model_inputs)
+
+            if 'encoder_hidden_states' not in model_inputs:
+                assert len(outputs) == 2
+                model_inputs['encoder_hidden_states'] = outputs[1]
+                model_inputs.pop('encoder_input_ids', None)
+                model_inputs.pop('encoder_attention_mask', None)
+
+            next_token_scores = outputs[0][:, -1, :]
+            next_token_scores = F.log_softmax(next_token_scores, dim=-1)
+            assert next_token_scores.size() == (batch_size * num_beams,
+                                                self.config.vocab_size)
+
+            next_token_scores = torch.gather(next_token_scores, 1, candidates)
+            # Avoid padding being selected
+            next_token_scores[candidates == 0] = -1e9
+            if gen_idx == 0:
+                next_token_scores[candidates == eos] = -1e9
+            assert next_token_scores.size() == (batch_size * num_beams,
+                                                vocab_size)
+
+            # Add scores to beams
+            sent_scores = next_token_scores + beam_scores[:, None].expand_as(
+                next_token_scores)
+            assert sent_scores.size() == (batch_size * num_beams, vocab_size)
+
+            sent_scores = sent_scores.reshape(batch_size,
+                                              num_beams * vocab_size)
+            next_scores, next_words = torch.topk(
+                sent_scores, num_beams * 2, dim=1, largest=True, sorted=True)
+            assert next_scores.size() == next_words.size() == (batch_size,
+                                                               num_beams * 2)
+
+            beam_ids = next_words // vocab_size
+            word_ids = next_words % vocab_size
+
+            # Convert back to 3D because beam_ids are indexes within
+            # the 3rd dimension.
+            candidates = candidates.reshape(batch_size, num_beams, -1)
+            candidates = torch.gather(
+                candidates, 1, beam_ids[:, :, None].expand(-1, -1, vocab_size))
+            assert candidates.size() == (batch_size, num_beams * 2, vocab_size)
+
+            next_token = torch.gather(candidates, 2, word_ids[:, :, None])
+            assert next_token.size() == (batch_size, num_beams * 2, 1)
+
+            candidates.scatter_(2, word_ids[:, :, None], 0)
+
+            decoder_input_ids = decoder_input_ids.reshape(
+                batch_size, num_beams, -1)
+            decoder_input_ids = torch.gather(
+                decoder_input_ids, 1, beam_ids[:, :, None].expand(
+                    -1, -1, decoder_input_ids.size(2)))
+            assert decoder_input_ids.size(1) == num_beams * 2
+
+            decoder_input_ids = torch.cat([decoder_input_ids, next_token],
+                                          dim=-1)
+
+            next_beam_idx = [[] for _ in range(batch_size)]
+            for batch_idx in range(batch_size):
+                for beam_idx in range(num_beams * 2):
+                    if decoder_input_ids[batch_idx, beam_idx, -1] == eos \
+                            or decoder_input_ids.size(2) == vocab_size:
+                        hyps[batch_idx].add(
+                            decoder_input_ids[batch_idx, beam_idx, 1:].clone(),
+                            next_scores[batch_idx, beam_idx])
+                    else:
+                        if len(next_beam_idx[batch_idx]) < num_beams:
+                            next_beam_idx[batch_idx].append(beam_idx)
+            next_beam_idx = input_ids.new_tensor(next_beam_idx)
+
+            candidates = torch.gather(
+                candidates, 1, next_beam_idx[..., None].expand(
+                    -1, -1, vocab_size))
+            candidates = candidates.reshape(batch_size * num_beams, -1)
+
+            decoder_input_ids = torch.gather(
+                decoder_input_ids, 1, next_beam_idx[..., None].expand(
+                    -1, -1, decoder_input_ids.size(2)))
+            decoder_input_ids = decoder_input_ids.reshape(
+                batch_size * num_beams, -1)
+
+            beam_scores = torch.gather(next_scores, 1, next_beam_idx)
+            beam_scores = beam_scores.view(-1)
+
+        # Remove <bos> token
+        gen_ids = input_ids.new_zeros((batch_size, vocab_size))
+        scores = gen_ids.new_zeros(batch_size, dtype=torch.float)
+        for i, hypotheses in enumerate(hyps):
+            best_hyp = max(hypotheses.hyp, key=lambda x: x[0])
+            gen_ids[i, :len(best_hyp[1])] = best_hyp[1]
+            scores[i] = best_hyp[0]
+
+        return gen_ids, scores.exp()
+
+
+class T5ForSequenceClassification(T5PreTrainedModel):
+    base_model_prefix = "t5"
+
+    def __init__(self, config):
+        super(T5ForSequenceClassification, self).__init__(config)
+        self.num_labels = config.num_labels
+
+        self.t5 = T5Model(config)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.classifier = nn.Linear(config.d_model, self.config.num_labels)
+
+        self.init_weights()
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        t5_outputs = self.t5(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=input_ids,
+            decoder_attention_mask=attention_mask,
+        )
+        next_token_logits = t5_outputs[0][:, -1, :]
+        logits = self.dropout(next_token_logits)
+        logits = self.classifier(logits)
+
+        outputs = (logits,)
+
+        if labels is not None:
+            if self.num_labels == 1:
+                #  We are doing regression
+                loss_fct = MSELoss()
+                loss = loss_fct(logits.view(-1), labels.view(-1))
+            else:
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            outputs = (loss,) + outputs
+
+        return outputs
