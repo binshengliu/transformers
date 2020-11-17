@@ -20,7 +20,7 @@ import torch
 from torch.nn import functional as F
 
 from .file_utils import ModelOutput
-from .generation_beam_search import BeamScorer, BeamSearchScorer
+from .generation_beam_search import BeamResults, BeamScorer, BeamSearchScorer
 from .generation_logits_process import (
     LogitsProcessorList,
     MinLengthLogitsProcessor,
@@ -316,7 +316,7 @@ class GenerationMixin:
         use_cache: Optional[bool] = None,
         prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
         **model_kwargs
-    ) -> torch.LongTensor:
+    ) -> ModelOutput:
         r"""
         Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
         multinomial sampling, beam-search decoding, and beam-search multinomial sampling.
@@ -478,9 +478,13 @@ class GenerationMixin:
             logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
             pad_token_id = eos_token_id
 
+        out = {}
         if self.config.is_encoder_decoder:
             # add encoder_outputs to model_kwargs
             model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(input_ids, model_kwargs)
+
+            # Make a copy. last_hidden_state will be replicated later.
+            out["encoder_outputs"] = ModelOutput(**model_kwargs["encoder_outputs"])
 
             # set input_ids as decoder_input_ids
             input_ids = self._prepare_decoder_input_ids_for_generation(
@@ -517,7 +521,7 @@ class GenerationMixin:
                 )
 
             # greedy search
-            return self.greedy_search(
+            gen_out = self.greedy_search(
                 input_ids,
                 logits_processor=logits_processor,
                 max_length=max_length,
@@ -541,7 +545,7 @@ class GenerationMixin:
             )
 
             # sample
-            return self.sample(
+            gen_out = self.sample(
                 input_ids,
                 logits_processor=logits_processor,
                 logits_warper=logits_warper,
@@ -573,7 +577,7 @@ class GenerationMixin:
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
             )
-            return self.beam_search(
+            gen_out = self.beam_search(
                 input_ids,
                 beam_scorer,
                 logits_processor=logits_processor,
@@ -608,7 +612,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-            return self.beam_sample(
+            gen_out = self.beam_sample(
                 input_ids,
                 beam_scorer,
                 logits_processor=logits_processor,
@@ -618,6 +622,7 @@ class GenerationMixin:
                 eos_token_id=eos_token_id,
                 **model_kwargs,
             )
+        return ModelOutput(**out, **gen_out)
 
     def greedy_search(
         self,
@@ -693,6 +698,7 @@ class GenerationMixin:
         sequence_lengths, unfinished_sequences, cur_len = self._init_sequence_length_for_generation(
             input_ids, max_length
         )
+        out = BeamResults(["confidence"])
 
         while cur_len < max_length:
             # prepare model inputs
@@ -700,7 +706,13 @@ class GenerationMixin:
 
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
+            out.append(outputs)
             next_token_logits = outputs.logits[:, -1, :]
+
+            # adjust tokens for Bart, *e.g.*
+            next_token_logits = self.adjust_logits_during_generation(
+                next_token_logits, cur_len=cur_len, max_length=max_length
+            )
 
             # pre-process distribution
             scores = logits_processor(input_ids, next_token_logits)
@@ -734,7 +746,7 @@ class GenerationMixin:
             # increase cur_len
             cur_len = cur_len + 1
 
-        return input_ids
+        return ModelOutput(generation=input_ids, **out)
 
     def sample(
         self,
@@ -823,6 +835,7 @@ class GenerationMixin:
         sequence_lengths, unfinished_sequences, cur_len = self._init_sequence_length_for_generation(
             input_ids, max_length
         )
+        out = BeamResults(["confidence"])
 
         # auto-regressive generation
         while cur_len < max_length:
@@ -831,7 +844,14 @@ class GenerationMixin:
 
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
+            out.append(outputs)
+
             next_token_logits = outputs.logits[:, -1, :]
+
+            # adjust tokens for Bart, *e.g.*
+            next_token_logits = self.adjust_logits_during_generation(
+                next_token_logits, cur_len=cur_len, max_length=max_length
+            )
 
             # pre-process distribution
             scores = logits_processor(input_ids, next_token_logits)
@@ -865,7 +885,7 @@ class GenerationMixin:
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
 
-        return input_ids
+        return ModelOutput(generation=input_ids, **out)
 
     def beam_search(
         self,
@@ -966,6 +986,8 @@ class GenerationMixin:
 
         batch_beam_size, cur_len = input_ids.shape
 
+        beam_out = BeamResults(["confidence"])
+
         assert (
             num_beams * batch_size == batch_beam_size
         ), "Batch dimension of `input_ids` should be {num_beams * batch_size}, but is {batch_beam_size}."
@@ -978,7 +1000,12 @@ class GenerationMixin:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             outputs = self(**model_inputs, return_dict=True)
+            beam_out.append(outputs)
+
             next_token_logits = outputs.logits[:, -1, :]
+
+            # It will be modified. Detach to save some memory.
+            next_token_logits = next_token_logits.detach()
 
             # adjust tokens for Bart, *e.g.*
             next_token_logits = self.adjust_logits_during_generation(
@@ -986,6 +1013,7 @@ class GenerationMixin:
             )
 
             next_token_scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
+            next_token_scores = next_token_scores.clone()
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
@@ -1003,6 +1031,7 @@ class GenerationMixin:
             # stateless
             beam_outputs = beam_scorer.process(
                 input_ids,
+                beam_out,
                 next_token_scores,
                 next_tokens,
                 next_indices,
@@ -1014,6 +1043,7 @@ class GenerationMixin:
             beam_idx = beam_outputs["next_beam_indices"]
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
+            beam_out.update_beam(beam_idx)
             cur_len = cur_len + 1
 
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -1025,11 +1055,17 @@ class GenerationMixin:
             if beam_scorer.is_done:
                 break
 
-        decoded = beam_scorer.finalize(
-            input_ids, beam_scores, next_tokens, next_indices, pad_token_id=pad_token_id, eos_token_id=eos_token_id
+        decoded, beam_out = beam_scorer.finalize(
+            input_ids,
+            beam_out,
+            beam_scores,
+            next_tokens,
+            next_indices,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
         )
 
-        return decoded
+        return ModelOutput(generation=decoded, **beam_out)
 
     def beam_sample(
         self,
@@ -1143,6 +1179,8 @@ class GenerationMixin:
 
         batch_beam_size, cur_len = input_ids.shape
 
+        beam_out = BeamResults(["confidence"])
+
         beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
@@ -1150,7 +1188,12 @@ class GenerationMixin:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             outputs = self(**model_inputs, return_dict=True)
+            beam_out.append(outputs)
+
             next_token_logits = outputs.logits[:, -1, :]
+
+            # It will be modified. Detach to save some memory.
+            next_token_logits = next_token_logits.detach()
 
             # adjust token scores (a no-op by default)
             next_token_logits = self.adjust_logits_during_generation(
@@ -1158,6 +1201,7 @@ class GenerationMixin:
             )
 
             next_token_scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
+            next_token_scores = next_token_scores.clone()
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
@@ -1180,6 +1224,7 @@ class GenerationMixin:
             # stateless
             beam_outputs = beam_scorer.process(
                 input_ids,
+                beam_out,
                 next_token_scores,
                 next_tokens,
                 next_indices,
@@ -1191,6 +1236,7 @@ class GenerationMixin:
             beam_idx = beam_outputs["next_beam_indices"]
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
+            beam_out.update_beam(beam_idx)
             cur_len = cur_len + 1
 
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -1202,11 +1248,17 @@ class GenerationMixin:
             if beam_scorer.is_done:
                 break
 
-        decoded = beam_scorer.finalize(
-            input_ids, beam_scores, next_tokens, next_indices, pad_token_id=pad_token_id, eos_token_id=eos_token_id
+        decoded, beam_out = beam_scorer.finalize(
+            input_ids,
+            beam_out,
+            beam_scores,
+            next_tokens,
+            next_indices,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
         )
 
-        return decoded
+        return ModelOutput(generation=decoded, **beam_out)
 
 
 def top_k_top_p_filtering(

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from collections import UserDict
+from collections import OrderedDict, UserDict
 from typing import Optional, Tuple
 
 import torch
@@ -95,6 +95,7 @@ class BeamScorer(ABC):
     def process(
         self,
         input_ids: torch.LongTensor,
+        beam_out: torch.FloatTensor,
         next_scores: torch.FloatTensor,
         next_tokens: torch.LongTensor,
         next_indices: torch.LongTensor,
@@ -107,6 +108,7 @@ class BeamScorer(ABC):
     def finalize(
         self,
         input_ids: torch.LongTensor,
+        beam_out: "BeamResults",
         next_scores: torch.FloatTensor,
         next_tokens: torch.LongTensor,
         next_indices: torch.LongTensor,
@@ -184,6 +186,7 @@ class BeamSearchScorer(BeamScorer):
     def process(
         self,
         input_ids: torch.LongTensor,
+        beam_out: "BeamResults",
         next_scores: torch.FloatTensor,
         next_tokens: torch.LongTensor,
         next_indices: torch.LongTensor,
@@ -226,8 +229,7 @@ class BeamSearchScorer(BeamScorer):
                     if is_beam_token_worse_than_top_num_beams:
                         continue
                     beam_hyp.add(
-                        input_ids[batch_beam_idx].clone(),
-                        next_score.item(),
+                        input_ids[batch_beam_idx].clone(), beam_out.take(batch_beam_idx), next_score.item(),
                     )
                 else:
                     # add next predicted token since it is not eos_token
@@ -261,6 +263,7 @@ class BeamSearchScorer(BeamScorer):
     def finalize(
         self,
         input_ids: torch.LongTensor,
+        beam_out: "BeamResults",
         final_beam_scores: torch.FloatTensor,
         final_beam_tokens: torch.LongTensor,
         final_beam_indices: torch.LongTensor,
@@ -279,7 +282,8 @@ class BeamSearchScorer(BeamScorer):
                 batch_beam_idx = batch_idx * self.num_beams + beam_id
                 final_score = final_beam_scores[batch_beam_idx].item()
                 final_tokens = input_ids[batch_beam_idx]
-                beam_hyp.add(final_tokens, final_score)
+                one_beam_out = beam_out.take(batch_beam_idx)
+                beam_hyp.add(final_tokens, one_beam_out, final_score)
 
         # select the best hypotheses
         sent_lengths = input_ids.new(batch_size * self.num_beam_hyps_to_keep)
@@ -289,9 +293,11 @@ class BeamSearchScorer(BeamScorer):
         for i, beam_hyp in enumerate(self._beam_hyps):
             sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])
             for j in range(self.num_beam_hyps_to_keep):
-                best_hyp = sorted_hyps.pop()[1]
+                beam = sorted_hyps.pop()
+                best_hyp = beam[1]
+                best_nll = beam[2]
                 sent_lengths[self.num_beam_hyps_to_keep * i + j] = len(best_hyp)
-                best.append(best_hyp)
+                best.append((best_hyp, best_nll))
 
         # prepare for adding eos
         sent_max_len = min(sent_lengths.max().item() + 1, self.max_length)
@@ -302,11 +308,13 @@ class BeamSearchScorer(BeamScorer):
             decoded.fill_(pad_token_id)
 
         # fill with hypotheses and eos_token_id if the latter fits in
-        for i, hypo in enumerate(best):
+        for i, (hypo, log_score) in enumerate(best):
             decoded[i, : sent_lengths[i]] = hypo
             if sent_lengths[i] < self.max_length:
                 decoded[i, sent_lengths[i]] = eos_token_id
-        return decoded
+
+        beam_out = BeamResults.stack([x[1] for x in best])
+        return decoded, beam_out
 
 
 class BeamHypotheses:
@@ -327,15 +335,15 @@ class BeamHypotheses:
         """
         return len(self.beams)
 
-    def add(self, hyp: torch.LongTensor, sum_logprobs: float):
+    def add(self, hyp: torch.LongTensor, nll_score: torch.FloatTensor, sum_logprobs: float):
         """
         Add a new hypothesis to the list.
         """
         score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
         if len(self) < self.num_beams or score > self.worst_score:
-            self.beams.append((score, hyp))
+            self.beams.append((score, hyp, nll_score))
             if len(self) > self.num_beams:
-                sorted_next_scores = sorted([(s, idx) for idx, (s, _) in enumerate(self.beams)])
+                sorted_next_scores = sorted([(s, idx) for idx, (s, *_) in enumerate(self.beams)])
                 del self.beams[sorted_next_scores[0][1]]
                 self.worst_score = sorted_next_scores[1][0]
             else:
@@ -355,3 +363,39 @@ class BeamHypotheses:
             cur_score = best_sum_logprobs / cur_len ** self.length_penalty
             ret = self.worst_score >= cur_score
             return ret
+
+
+class BeamResults(OrderedDict):
+    def __init__(self, keys):
+        self._keys = keys
+
+    def append(self, outputs):
+        for k in self._keys:
+            if k not in self:
+                self[k] = outputs[k].clone()
+            else:
+                self[k] = torch.cat([self[k], outputs[k][:, -1:]], dim=1)
+
+    def update_beam(self, beam_swap_idx):
+        for k in self._keys:
+            self[k] = self[k][beam_swap_idx]
+
+    def take(self, beam_idx):
+        new = BeamResults(self._keys)
+        for k in self._keys:
+            new[k] = self[k][beam_idx].clone()
+        return new
+
+    @staticmethod
+    def stack(list_of_results):
+        keys = list_of_results[0]._keys
+        results = BeamResults(keys)
+        for k in keys:
+            max_len = max(x[k].shape[0] for x in list_of_results)
+            target_shape = (len(list_of_results), max_len) + list_of_results[0][k].shape[1:]
+            results[k] = list_of_results[0][k].new_zeros(target_shape)
+        for i in range(len(list_of_results)):
+            for k in keys:
+                current = list_of_results[i][k]
+                results[k][i, : len(current)] = current
+        return results
