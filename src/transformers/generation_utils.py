@@ -800,6 +800,7 @@ class GenerationMixin:
         sequence_lengths, unfinished_sequences, cur_len = self._init_sequence_length_for_generation(
             input_ids, max_length
         )
+        nll_scores = torch.zeros_like(input_ids, dtype=torch.float)
 
         # auto-regressive generation
         while cur_len < max_length:
@@ -809,6 +810,8 @@ class GenerationMixin:
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
             next_token_logits = outputs.logits[:, -1, :]
+            orig_nll = -F.log_softmax(next_token_logits, dim=-1)
+            next_token_logits = next_token_logits.clone()
 
             # pre-process distribution
             scores = logits_processor(input_ids, next_token_logits)
@@ -825,6 +828,11 @@ class GenerationMixin:
 
             # add token and increase length by one
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            next_token_nll = torch.gather(orig_nll, -1, next_tokens[:, None])
+            next_token_nll = torch.where(
+                unfinished_sequences[:, None].bool(), next_token_nll, next_token_nll.new_tensor(0.0)
+            )
+            nll_scores = torch.cat([nll_scores, next_token_nll], dim=-1)
             cur_len = cur_len + 1
 
             # update sequence length
@@ -842,7 +850,7 @@ class GenerationMixin:
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
 
-        return input_ids
+        return input_ids, nll_scores
 
     def beam_search(
         self,
@@ -1119,6 +1127,7 @@ class GenerationMixin:
         num_beams = beam_scorer.num_beams
 
         batch_beam_size, cur_len = input_ids.shape
+        nll_scores = torch.zeros_like(input_ids, dtype=torch.float)
 
         beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
         beam_scores = beam_scores.view((batch_size * num_beams,))
@@ -1135,6 +1144,8 @@ class GenerationMixin:
             )
 
             next_token_scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
+            orig_nll = -next_token_scores
+            next_token_scores = next_token_scores.clone()
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
@@ -1154,12 +1165,17 @@ class GenerationMixin:
             next_indices = next_tokens // vocab_size
             next_tokens = next_tokens % vocab_size
 
+            # EOS scores are needed when a sentence is finished in beam_scorer.process.
+            eos_indices = next_tokens.new_full((orig_nll.shape[0], 1), eos_token_id)
+            eos_scores = torch.gather(orig_nll, -1, eos_indices)
             # stateless
             beam_outputs = beam_scorer.process(
                 input_ids,
+                nll_scores,
                 next_token_scores,
                 next_tokens,
                 next_indices,
+                eos_scores=eos_scores,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
             )
@@ -1168,6 +1184,9 @@ class GenerationMixin:
             beam_idx = beam_outputs["next_beam_indices"]
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
+            nll_scores = torch.cat(
+                [nll_scores[beam_idx, :], torch.gather(orig_nll, -1, beam_next_tokens[:, None])], dim=-1
+            )
             cur_len = cur_len + 1
 
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -1179,11 +1198,17 @@ class GenerationMixin:
             if beam_scorer.is_done:
                 break
 
-        decoded = beam_scorer.finalize(
-            input_ids, beam_scores, next_tokens, next_indices, pad_token_id=pad_token_id, eos_token_id=eos_token_id
+        decoded, nll_scores = beam_scorer.finalize(
+            input_ids,
+            nll_scores,
+            beam_scores,
+            next_tokens,
+            next_indices,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
         )
 
-        return decoded
+        return decoded, nll_scores
 
 
 def top_k_top_p_filtering(
