@@ -312,6 +312,7 @@ class BartEncoder(nn.Module):
         self.max_source_positions = config.max_position_embeddings
 
         self.embed_tokens = embed_tokens
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, embed_dim)
         if config.static_position_embeddings:
             self.embed_positions = SinusoidalPositionalEmbedding(
                 config.max_position_embeddings, embed_dim, self.padding_idx
@@ -329,7 +330,7 @@ class BartEncoder(nn.Module):
         self.layer_norm = LayerNorm(config.d_model) if config.add_final_layer_norm else None
 
     def forward(
-        self, input_ids, attention_mask=None, output_attentions=False, output_hidden_states=False, return_dict=False
+        self, input_ids, attention_mask=None, token_type_ids=None, output_attentions=False, output_hidden_states=False, return_dict=False
     ):
         """
         Args:
@@ -353,6 +354,8 @@ class BartEncoder(nn.Module):
         inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
         embed_pos = self.embed_positions(input_ids)
         x = inputs_embeds + embed_pos
+        if token_type_ids is not None:
+            x += self.token_type_embeddings(token_type_ids)
         x = self.layernorm_embedding(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
 
@@ -865,6 +868,7 @@ class BartModel(PretrainedBartModel):
         self,
         input_ids,
         attention_mask=None,
+        token_type_ids=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
         encoder_outputs: Optional[Tuple] = None,
@@ -910,6 +914,7 @@ class BartModel(PretrainedBartModel):
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,

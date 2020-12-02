@@ -144,6 +144,7 @@ class BartConfig(PretrainedConfig):
         static_position_embeddings=False,
         add_bias_logits=False,
         force_bos_token_to_be_generated=False,
+        type_vocab_size=2,
         **common_kwargs
     ):
         r"""
@@ -206,6 +207,7 @@ class BartConfig(PretrainedConfig):
         self.force_bos_token_to_be_generated = force_bos_token_to_be_generated
 
         self.do_blenderbot_90_layernorm = do_blenderbot_90_layernorm
+        self.type_vocab_size = type_vocab_size
 
     @property
     def num_attention_heads(self) -> int:
