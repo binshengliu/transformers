@@ -83,6 +83,8 @@ class GenerationMixin:
             argument: value for argument, value in model_kwargs.items() if not argument.startswith("decoder_")
         }
         model_kwargs["encoder_outputs"]: ModelOutput = encoder(input_ids, return_dict=True, **encoder_kwargs)
+        if "attention_mask" in model_kwargs["encoder_outputs"]:
+            model_kwargs["attention_mask"] = model_kwargs["encoder_outputs"]["attention_mask"]
         return model_kwargs
 
     def _prepare_decoder_input_ids_for_generation(
