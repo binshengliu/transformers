@@ -159,6 +159,10 @@ class GenerationMixin:
             encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
                 0, expanded_return_idx
             )
+            if "rel_weights" in encoder_outputs:
+                encoder_outputs["rel_weights"] = encoder_outputs.rel_weights.index_select(0, expanded_return_idx)
+            if "rel_logits" in encoder_outputs:
+                encoder_outputs["rel_logits"] = encoder_outputs.rel_logits.index_select(0, expanded_return_idx)
             model_kwargs["encoder_outputs"] = encoder_outputs
         return input_ids, model_kwargs
 
