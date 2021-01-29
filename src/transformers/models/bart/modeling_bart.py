@@ -25,6 +25,7 @@ from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
 from ...file_utils import (
+    ModelOutput,
     add_code_sample_docstrings,
     add_end_docstrings,
     add_start_docstrings,
@@ -33,7 +34,6 @@ from ...file_utils import (
 )
 from ...modeling_outputs import (
     BaseModelOutput,
-    BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput,
     Seq2SeqModelOutput,
     Seq2SeqQuestionAnsweringModelOutput,
@@ -528,6 +528,8 @@ class BartDecoder(nn.Module):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
+        output_last_cross_attentions=False,
+        output_last_attentions=False,
     ):
         """
         Includes several features from "Jointly Learning to Align and Translate with Transformer Models" (Garg et al.,
@@ -590,6 +592,11 @@ class BartDecoder(nn.Module):
 
             layer_state = past_key_values[idx] if past_key_values is not None else None
 
+            output_attn = output_attentions
+            if output_last_cross_attentions and idx == len(self.layers) - 1:
+                output_attn = True
+            if output_last_attentions and idx == len(self.layers) - 1:
+                output_attn = True
             x, layer_self_attn, layer_past, layer_cross_attn = decoder_layer(
                 x,
                 encoder_hidden_states,
@@ -597,7 +604,7 @@ class BartDecoder(nn.Module):
                 decoder_padding_mask=decoder_padding_mask,
                 layer_state=layer_state,
                 causal_mask=decoder_causal_mask,
-                output_attentions=output_attentions,
+                output_attentions=output_attn,
             )
 
             if use_cache:
@@ -606,6 +613,9 @@ class BartDecoder(nn.Module):
             if output_attentions:
                 all_self_attns += (layer_self_attn,)
                 all_cross_attentions += (layer_cross_attn,)
+
+        last_cross_attentions = layer_cross_attn
+        last_attentions = layer_self_attn
 
         if self.layer_norm:  # if config.add_final_layer_norm (mBART)
             x = self.layer_norm(x)
@@ -621,12 +631,14 @@ class BartDecoder(nn.Module):
             return tuple(
                 v for v in [x, next_cache, all_hidden_states, all_self_attns, all_cross_attentions] if v is not None
             )
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return ModelOutput(
             last_hidden_state=x,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             cross_attentions=all_cross_attentions,
+            last_cross_attentions=last_cross_attentions,
+            last_attentions=last_attentions,
         )
 
 
@@ -859,6 +871,8 @@ class BartModel(PretrainedBartModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        output_last_cross_attentions=False,
+        output_last_decoder_attentions=False,
     ):
 
         if decoder_input_ids is None:
@@ -915,17 +929,21 @@ class BartModel(PretrainedBartModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            output_last_cross_attentions=output_last_cross_attentions,
+            output_last_attentions=output_last_decoder_attentions,
         )
 
         if not return_dict:
             return decoder_outputs + encoder_outputs
 
-        return Seq2SeqModelOutput(
+        return ModelOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
             cross_attentions=decoder_outputs.cross_attentions,
+            last_decoder_attentions=decoder_outputs.last_attentions,
+            last_cross_attentions=decoder_outputs.last_cross_attentions,
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
