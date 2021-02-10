@@ -592,9 +592,13 @@ class GenerationMixin:
                 top_k=top_k, top_p=top_p, temperature=temperature, num_beams=num_beams
             )
 
-            batch_size = input_ids.shape[0] * num_return_sequences
+            batch_size = input_ids.shape[0]
 
             length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+
+            if num_return_sequences > num_beams:
+                raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+
             beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
                 max_length=max_length,
@@ -602,14 +606,12 @@ class GenerationMixin:
                 device=self.device,
                 length_penalty=length_penalty,
                 do_early_stopping=early_stopping,
+                num_beam_hyps_to_keep=num_return_sequences,
             )
 
             # interleave with `num_beams * num_return_sequences`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids,
-                expand_size=num_beams * num_return_sequences,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs,
             )
 
             gen_out = self.beam_sample(
@@ -1017,6 +1019,9 @@ class GenerationMixin:
 
             next_token_scores = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
+
+            deduplicate_maybe_(input_ids, num_beams, next_token_scores)
+
             # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
@@ -1207,6 +1212,8 @@ class GenerationMixin:
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
             next_token_scores = logits_warper(input_ids, next_token_scores)
 
+            deduplicate_maybe_(input_ids, num_beams, next_token_scores)
+
             # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
@@ -1288,3 +1295,29 @@ def top_k_top_p_filtering(
         logits = TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=min_tokens_to_keep)(None, logits)
 
     return logits
+
+
+def deduplicate_maybe_(input_ids: torch.Tensor, num_beams: int, scores: torch.Tensor) -> torch.Tensor:
+    batch_size = input_ids.shape[0] // num_beams
+    input_ids = input_ids.view(batch_size, num_beams, -1)
+
+    # First create a self comparison matrix. Imagine the last dimension as one primitive
+    # element. For example [[1], [2], [3], [1]] == [[1, 2, 3, 1]] creates a matrix
+    # identifying the duplicates.
+    dup_beam_mask = (input_ids[:, :, None, :] == input_ids[:, None, :, :]).all(dim=-1)
+    # Take the upper triangle due to symmetry.
+    dup_beam_mask = torch.triu(dup_beam_mask, 1)
+    # Reduce dimension the expanded dimension.
+    dup_beam_mask = dup_beam_mask.any(dim=1)
+    # Reshape to be able to mask scores.
+    dup_beam_mask = dup_beam_mask.view(batch_size * num_beams)
+
+    deduped_scores = scores.masked_fill(dup_beam_mask[:, None], float("-inf"))
+
+    # Make sure after deduplication there are enough words to sample. Otherwise
+    # just leave it.
+    deduped_scores = deduped_scores.view(batch_size, num_beams, -1)
+    valid_dedup = (~deduped_scores.isinf()).sum(-1).sum(-1) >= 2 * num_beams
+    scores = scores.view(batch_size, num_beams, -1)
+    scores[valid_dedup] = deduped_scores[valid_dedup]
+    return scores
