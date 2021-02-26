@@ -658,6 +658,7 @@ class BartDecoder(nn.Module):
             x = self.layernorm_embedding(x)
 
         x = F.dropout(x, p=self.dropout, training=self.training)
+        first_hidden_states = x.clone()
 
         x = x.transpose(0, 1)
         if encoder_hidden_states.ndim == 4:
@@ -733,6 +734,7 @@ class BartDecoder(nn.Module):
             cross_attentions=all_cross_attentions,
             last_cross_attentions=last_cross_attentions,
             last_attentions=last_attentions,
+            first_hidden_states=first_hidden_states,
         )
 
 
@@ -1179,6 +1181,7 @@ class BartModel(PretrainedBartModel):
             cross_attentions=decoder_outputs.cross_attentions,
             last_decoder_attentions=decoder_outputs.last_attentions,
             last_cross_attentions=decoder_outputs.last_cross_attentions,
+            decoder_first_hidden_states=decoder_outputs.first_hidden_states,
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
@@ -1300,7 +1303,7 @@ class BartForConditionalGeneration(PretrainedBartModel):
         self, decoder_input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
     ):
         return {
-            "input_ids": None,  # encoder_outputs is defined. input_ids not needed
+            "input_ids": kwargs["encoder_input_ids"],  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
             "past_key_values": past,
             "decoder_input_ids": decoder_input_ids,

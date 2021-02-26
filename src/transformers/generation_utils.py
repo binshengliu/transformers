@@ -85,6 +85,7 @@ class GenerationMixin:
         model_kwargs["encoder_outputs"]: ModelOutput = encoder(input_ids, return_dict=True, **encoder_kwargs)
         if "attention_mask" in model_kwargs["encoder_outputs"]:
             model_kwargs["attention_mask"] = model_kwargs["encoder_outputs"]["attention_mask"]
+        model_kwargs["encoder_input_ids"] = input_ids
         return model_kwargs
 
     def _prepare_decoder_input_ids_for_generation(
@@ -150,6 +151,10 @@ class GenerationMixin:
         if "token_type_ids" in model_kwargs:
             token_type_ids = model_kwargs["token_type_ids"]
             model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if "encoder_input_ids" in model_kwargs:
+            encoder_input_ids = model_kwargs["encoder_input_ids"]
+            model_kwargs["encoder_input_ids"] = encoder_input_ids.index_select(0, expanded_return_idx)
 
         if attention_mask is not None:
             model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
