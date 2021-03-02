@@ -876,7 +876,7 @@ class GenerationMixin:
 
             # sample
             probs = F.softmax(scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            next_tokens = torch.multinomial(probs.float(), num_samples=1).squeeze(1)
 
             # add code that transfomers next_tokens to tokens_to_add
             if eos_token_id is not None:
