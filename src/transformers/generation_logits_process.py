@@ -227,6 +227,56 @@ class TopKLogitsWarper(LogitsWarper):
         return scores
 
 
+class TopKPLogitsWarper(LogitsWarper):
+    r"""
+    :class:`transformers.LogitsWarper` that performs top-k, i.e. restricting to the k highest probability elements.
+
+    Args:
+        top_k (:obj:`int`):
+            The number of highest probability vocabulary tokens to keep for top-k-filtering.
+        filter_value (:obj:`float`, `optional`, defaults to :obj:`-float("Inf")`):
+            All filtered values will be set to this float value.
+        min_tokens_to_keep (:obj:`int`, `optional`, defaults to 1):
+            Minimum number of tokens that cannot be filtered.
+    """
+
+    def __init__(self, top_k: int, top_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
+        if not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError(f"`top_k` has to be a strictly positive integer, but is {top_k}")
+
+        if not isinstance(top_p, float) or (top_p < 0 or top_p > 1.0):
+            raise ValueError(f"`top_p` has to be a float > 0 and < 1, but is {top_p}")
+
+        self.top_k = top_k
+        self.top_p = top_p
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        top_k = min(max(self.top_k, self.min_tokens_to_keep), scores.size(-1))  # Safety check
+        # Remove all tokens with a probability less than the last token of the top-k
+        top_k_indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
+
+        sorted_logits, sorted_indices = torch.sort(scores, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        sorted_indices_to_remove = cumulative_probs > self.top_p
+        if self.min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
+            sorted_indices_to_remove[..., : self.min_tokens_to_keep - 1] = 0
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # scatter sorted tensors to original indexing
+        top_p_indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+
+        indices_to_remove = top_k_indices_to_remove | top_p_indices_to_remove
+        scores[indices_to_remove] = self.filter_value
+        return scores
+
+
 class NoRepeatNGramLogitsProcessor(LogitsProcessor):
     r"""
     :class:`transformers.LogitsProcessor` that enforces no repetition of n-grams. See `Fairseq
